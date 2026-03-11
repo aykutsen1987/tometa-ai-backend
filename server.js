@@ -1,13 +1,9 @@
 /**
- * ToMeta AI Proxy Backend
+ * ToMeta AI Proxy Backend v3
  *
- * Güvenli proxy: API key'leri sunucuda tutar, telefona göndermez.
- * Tüm istekler APP_SECRET ile doğrulanır.
- *
- * Desteklenen servisler:
- *  POST /api/gemini  → Google Gemini 2.0 Flash / Flash-Lite / Pro (fallback zinciri)
- *  POST /api/groq    → Groq Whisper Large v3 / v3 Turbo (fallback zinciri)
- *  GET  /health      → Sunucu sağlık kontrolü
+ * POST /api/gemini  → Google SDK ile Gemini (ScanMeta yöntemi) → Groq Vision fallback
+ * POST /api/groq    → Groq Whisper (ses→TXT)
+ * GET  /health      → Sağlık kontrolü
  */
 
 const express    = require('express');
@@ -15,208 +11,184 @@ const multer     = require('multer');
 const axios      = require('axios');
 const FormData   = require('form-data');
 const fs         = require('fs');
-const path       = require('path');
 const rateLimit  = require('express-rate-limit');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Ortam değişkenleri ───────────────────────────────────────────────────────
-const APP_SECRET      = process.env.APP_SECRET;       // Uygulama ile paylaşılan gizli şifre
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY;   // Google AI Studio
-const GROQ_API_KEY    = process.env.GROQ_API_KEY;     // Groq Console
+const APP_SECRET     = process.env.APP_SECRET;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY   = process.env.GROQ_API_KEY;
 
-if (!APP_SECRET || !GEMINI_API_KEY || !GROQ_API_KEY) {
-  console.error('❌ Eksik ortam değişkeni: APP_SECRET, GEMINI_API_KEY, GROQ_API_KEY gerekli');
+if (!APP_SECRET || !GROQ_API_KEY) {
+  console.error('❌ Eksik: APP_SECRET ve GROQ_API_KEY zorunlu');
   process.exit(1);
 }
 
-// ─── Gemini model fallback zinciri ────────────────────────────────────────────
-// Ücretsiz limitler:
-//   gemini-2.0-flash-lite : 1500 req/gün, 30 req/dk  ← ana model
-//   gemini-2.0-flash      :  500 req/gün, 15 req/dk  ← yedek 1
-//   gemini-1.5-flash      :  500 req/gün, 15 req/dk  ← yedek 2
+// ── Model listeleri ──────────────────────────────────────────────────────────
+// ScanMeta'da çalışan Gemini modelleri (Google SDK formatı)
 const GEMINI_MODELS = [
-  'gemini-2.0-flash-lite',
-  'gemini-2.0-flash',
-  'gemini-1.5-flash',
+  'models/gemini-1.5-flash',
+  'models/gemini-2.0-flash-lite',
+  'models/gemini-2.0-flash',
+  'models/gemini-1.5-pro',
 ];
 
-// ─── Groq model fallback zinciri ─────────────────────────────────────────────
-// Ücretsiz limitler:
-//   whisper-large-v3-turbo : 20 req/dk, 7200 sn/saat  ← ana model (daha hızlı)
-//   whisper-large-v3       : 20 req/dk, 7200 sn/saat  ← yedek
-const GROQ_MODELS = [
+// Groq Vision — görsel okuma (Gemini başarısız olursa)
+const GROQ_VISION_MODELS = [
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+  'llama-3.2-90b-vision-preview',
+  'llama-3.2-11b-vision-preview',
+];
+
+// Groq Whisper — ses transkripsiyon
+const GROQ_WHISPER_MODELS = [
   'whisper-large-v3-turbo',
   'whisper-large-v3',
 ];
 
-// ─── Multer (dosya yükleme) ───────────────────────────────────────────────────
-const upload = multer({
-  dest: '/tmp/tometa_uploads/',
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB max
-});
-
-// ─── Rate limiting ────────────────────────────────────────────────────────────
-const limiter = rateLimit({
-  windowMs: 60 * 1000,      // 1 dakika
-  max: 30,                   // IP başına 30 istek/dk
-  message: { error: 'Çok fazla istek. Lütfen bekleyin.' },
-});
+const upload = multer({ dest: '/tmp/tometa_uploads/', limits: { fileSize: 25 * 1024 * 1024 } });
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Çok fazla istek.' } });
 app.use(limiter);
-
 app.use(express.json({ limit: '25mb' }));
 
-// ─── Auth middleware ──────────────────────────────────────────────────────────
 function requireSecret(req, res, next) {
   const secret = req.headers['x-app-secret'] || req.body?.appSecret;
   if (!secret || secret !== APP_SECRET) {
-    console.warn(`⛔ Yetkisiz erişim: ${req.ip} → ${req.path}`);
+    console.warn(`⛔ Yetkisiz: ${req.ip}`);
     return res.status(401).json({ error: 'Yetkisiz erişim.' });
   }
   next();
 }
 
-// ─── Yardımcı: dosyayı temizle ───────────────────────────────────────────────
-function cleanupFile(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+function cleanupFile(fp) {
+  if (fp && fs.existsSync(fp)) { try { fs.unlinkSync(fp); } catch(_) {} }
 }
 
-// ─── Sağlık kontrolü ─────────────────────────────────────────────────────────
+// ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'ToMeta AI Proxy',
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ status: 'ok', service: 'ToMeta AI Proxy v3', gemini: !!GEMINI_API_KEY, groq: !!GROQ_API_KEY });
 });
 
-// ─── POST /api/gemini ─────────────────────────────────────────────────────────
-/**
- * İstek (multipart/form-data):
- *   file       : Dosya (PDF, DOCX, JPG, PNG, WEBP, BMP, GIF)
- *   mimeType   : Dosyanın MIME tipi (örn. "application/pdf")
- *   sourceType : "image" | "document"  (prompt seçimi için)
- *
- * Header:
- *   x-app-secret : APP_SECRET değeri
- *
- * Yanıt:
- *   { success: true, text: "..." }
- *   { success: false, error: "..." }
- */
+// ── POST /api/gemini ─────────────────────────────────────────────────────────
 app.post('/api/gemini', requireSecret, upload.single('file'), async (req, res) => {
   const filePath = req.file?.path;
-
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'Dosya bulunamadı.' });
-    }
+    if (!req.file) return res.status(400).json({ success: false, error: 'Dosya bulunamadı.' });
 
-    const mimeType   = req.body.mimeType   || 'application/octet-stream';
-    const sourceType = req.body.sourceType || 'document';
-
+    const mimeType   = req.body.mimeType   || 'image/jpeg';
+    const sourceType = req.body.sourceType || 'image';
     const prompt = sourceType === 'image'
       ? 'Bu görseldeki tüm metni aynen çıkar. Sadece metni döndür, açıklama ekleme.'
       : 'Bu belgeden tüm metni çıkar. Orijinal paragraf ve satır düzenini koru. Sadece metni döndür.';
 
-    // Dosyayı base64'e çevir
     const fileBuffer = fs.readFileSync(filePath);
     const base64Data = fileBuffer.toString('base64');
 
-    const requestBody = {
-      contents: [{
-        parts: [
-          { text: prompt },
-          {
-            inline_data: {
-              mime_type: mimeType,
-              data: base64Data,
+    // 1. Gemini — Google SDK formatında (ScanMeta yöntemi)
+    if (GEMINI_API_KEY) {
+      for (const model of GEMINI_MODELS) {
+        try {
+          console.log(`🔄 Gemini deneniyor: ${model}`);
+
+          // SDK'nın kullandığı endpoint formatı (v1beta, model adı prefix'li)
+          const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${GEMINI_API_KEY}`;
+
+          const response = await axios.post(url, {
+            contents: [{
+              parts: [
+                { text: prompt },
+                { inline_data: { mime_type: mimeType, data: base64Data } }
+              ]
+            }],
+            generationConfig: {
+              temperature: 0.1,
+              topP: 0.95,
+              maxOutputTokens: 8192
             },
-          },
-        ],
-      }],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 8192,
-      },
-    };
+            systemInstruction: {
+              parts: [{ text: 'Gelişmiş OCR asistanısın. Karakter hatalarını düzelt. Sadece temiz metni döndür.' }]
+            }
+          }, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 90000
+          });
 
-    // Model fallback zinciri
-    let lastError = null;
-    for (const model of GEMINI_MODELS) {
-      try {
-        console.log(`🔄 Gemini deneniyor: ${model}`);
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+          const text = parseGeminiResponse(response.data);
+          if (!text || text.trim() === '') throw new Error('Gemini boş yanıt döndürdü.');
+          console.log(`✅ Gemini başarılı (${model}): ${text.length} karakter`);
+          return res.json({ success: true, text: text.trim(), model });
 
-        const response = await axios.post(url, requestBody, {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 90000, // 90 saniye
-        });
-
-        const text = parseGeminiResponse(response.data);
-        if (!text || text.trim() === '') {
-          throw new Error('Gemini boş yanıt döndürdü.');
+        } catch (err) {
+          const status = err.response?.status;
+          const msg = err.response?.data?.error?.message || err.message;
+          console.warn(`⚠️ ${model} başarısız (${status}): ${msg.slice(0, 100)}`);
+          // 429 ve 503'te sonraki modeli dene, diğer hatalarda çık
+          if (status !== 429 && status !== 503 && status !== 500) break;
         }
-
-        console.log(`✅ Gemini başarılı (${model}): ${text.length} karakter`);
-        return res.json({ success: true, text: text.trim(), model });
-
-      } catch (err) {
-        const status = err.response?.status;
-        lastError = err.response?.data?.error?.message || err.message;
-        console.warn(`⚠️ ${model} başarısız (${status}): ${lastError}`);
-
-        // 429 (rate limit) veya 503 → bir sonraki modeli dene
-        // Diğer hatalar → direkt başarısız say
-        if (status !== 429 && status !== 503 && status !== 500) break;
       }
     }
 
-    return res.status(502).json({
-      success: false,
-      error: `Tüm Gemini modelleri başarısız: ${lastError}`,
-    });
+    // 2. Groq Vision fallback
+    console.log('🔄 Groq Vision fallback devreye giriyor...');
+    for (const model of GROQ_VISION_MODELS) {
+      try {
+        console.log(`🔄 Groq Vision: ${model}`);
+        const response = await axios.post(
+          'https://api.groq.com/openai/v1/chat/completions',
+          {
+            model,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: prompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}` } },
+              ],
+            }],
+            temperature: 0,
+            max_tokens: 8192,
+          },
+          {
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+            timeout: 90000
+          }
+        );
+
+        const text = response.data?.choices?.[0]?.message?.content || '';
+        if (!text.trim()) throw new Error('Groq Vision boş yanıt.');
+        console.log(`✅ Groq Vision başarılı (${model}): ${text.length} karakter`);
+        return res.json({ success: true, text: text.trim(), model: `groq:${model}` });
+
+      } catch (err) {
+        const status = err.response?.status;
+        const msg = err.response?.data?.error?.message || err.message;
+        console.warn(`⚠️ Groq Vision ${model} (${status}): ${msg.slice(0, 80)}`);
+        if (status !== 429 && status !== 503) break;
+      }
+    }
+
+    return res.status(502).json({ success: false, error: 'Gemini ve Groq Vision başarısız.' });
 
   } catch (err) {
-    console.error('Gemini genel hata:', err.message);
+    console.error('Genel hata:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   } finally {
     cleanupFile(filePath);
   }
 });
 
-// ─── POST /api/groq ───────────────────────────────────────────────────────────
-/**
- * İstek (multipart/form-data):
- *   file     : Ses/Video dosyası (mp3, mp4, wav, avi, flac, ogg, webm, m4a)
- *   language : Dil kodu (varsayılan: "tr")
- *
- * Header:
- *   x-app-secret : APP_SECRET değeri
- *
- * Yanıt:
- *   { success: true, text: "..." }
- *   { success: false, error: "..." }
- */
+// ── POST /api/groq — Whisper ─────────────────────────────────────────────────
 app.post('/api/groq', requireSecret, upload.single('file'), async (req, res) => {
   const filePath = req.file?.path;
-
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'Dosya bulunamadı.' });
-    }
-
+    if (!req.file) return res.status(400).json({ success: false, error: 'Dosya bulunamadı.' });
     const language = req.body.language || 'tr';
-
-    // Model fallback zinciri
     let lastError = null;
-    for (const model of GROQ_MODELS) {
-      try {
-        console.log(`🔄 Groq deneniyor: ${model}`);
 
+    for (const model of GROQ_WHISPER_MODELS) {
+      try {
+        console.log(`🔄 Groq Whisper: ${model}`);
         const form = new FormData();
         form.append('file', fs.createReadStream(filePath), {
           filename: req.file.originalname || 'audio.mp3',
@@ -229,79 +201,43 @@ app.post('/api/groq', requireSecret, upload.single('file'), async (req, res) => 
         const response = await axios.post(
           'https://api.groq.com/openai/v1/audio/transcriptions',
           form,
-          {
-            headers: {
-              'Authorization': `Bearer ${GROQ_API_KEY}`,
-              ...form.getHeaders(),
-            },
-            timeout: 120000, // 2 dakika
-          }
+          { headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, ...form.getHeaders() }, timeout: 120000 }
         );
 
-        const text = typeof response.data === 'string'
-          ? response.data
-          : response.data?.text || '';
-
-        if (!text || text.trim() === '') {
-          throw new Error('Groq boş transkripsiyon döndürdü.');
-        }
-
-        console.log(`✅ Groq başarılı (${model}): ${text.length} karakter`);
+        const text = typeof response.data === 'string' ? response.data : response.data?.text || '';
+        if (!text.trim()) throw new Error('Groq boş transkripsiyon.');
+        console.log(`✅ Groq Whisper başarılı (${model}): ${text.length} karakter`);
         return res.json({ success: true, text: text.trim(), model });
 
       } catch (err) {
         const status = err.response?.status;
         lastError = err.response?.data?.error?.message || err.message;
-        console.warn(`⚠️ ${model} başarısız (${status}): ${lastError}`);
-
+        console.warn(`⚠️ ${model} (${status}): ${lastError}`);
         if (status !== 429 && status !== 503 && status !== 500) break;
       }
     }
 
-    return res.status(502).json({
-      success: false,
-      error: `Tüm Groq modelleri başarısız: ${lastError}`,
-    });
-
+    return res.status(502).json({ success: false, error: `Groq başarısız: ${lastError}` });
   } catch (err) {
-    console.error('Groq genel hata:', err.message);
+    console.error('Groq hata:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   } finally {
     cleanupFile(filePath);
   }
 });
 
-// ─── Gemini yanıt ayrıştırıcı ────────────────────────────────────────────────
 function parseGeminiResponse(data) {
-  try {
-    const candidates = data.candidates || [];
-    let result = '';
-    for (const candidate of candidates) {
-      const parts = candidate?.content?.parts || [];
-      for (const part of parts) {
-        if (part.text) result += part.text;
-      }
-    }
-    return result;
-  } catch (e) {
-    throw new Error(`Gemini yanıtı ayrıştırılamadı: ${e.message}`);
-  }
+  let result = '';
+  for (const c of (data.candidates || []))
+    for (const p of (c?.content?.parts || []))
+      if (p.text) result += p.text;
+  return result;
 }
 
-// ─── 404 handler ─────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint bulunamadı.' });
-});
+app.use((req, res) => res.status(404).json({ error: 'Endpoint bulunamadı.' }));
+app.use((err, req, res, _next) => { console.error('Sunucu hatası:', err); res.status(500).json({ error: 'Sunucu hatası.' }); });
 
-// ─── Global hata handler ─────────────────────────────────────────────────────
-app.use((err, req, res, _next) => {
-  console.error('Sunucu hatası:', err);
-  res.status(500).json({ error: 'Sunucu hatası.' });
-});
-
-// ─── Başlat ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🚀 ToMeta AI Proxy başlatıldı → port ${PORT}`);
-  console.log(`   Gemini modeller: ${GEMINI_MODELS.join(' → ')}`);
-  console.log(`   Groq modeller:   ${GROQ_MODELS.join(' → ')}`);
+  console.log(`🚀 ToMeta AI Proxy v3 → port ${PORT}`);
+  console.log(`   Gemini: ${GEMINI_API_KEY ? '✅' : '⚠️ yok'} | Groq: ✅`);
 });
