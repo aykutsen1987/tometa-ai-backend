@@ -1,16 +1,18 @@
-# Render deployment configuration
-# Bu dosyayı projenin köküne koy, Render otomatik tanır.
-
 services:
   - type: web
-    name: tometa-ai-proxy
-    env: node
+    name: tometa-ai-backend
+    runtime: node
     plan: free
+    region: frankfurt
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
-
-    # Environment Variables → Render Dashboard'dan ekle:
-    # APP_SECRET      = güçlü bir şifre (en az 32 karakter)
-    # GEMINI_API_KEY  = Google AI Studio'dan al
-    # GROQ_API_KEY    = Groq Console'dan al
+    envVars:
+      - key: APP_SECRET
+        sync: false          # Dashboard'dan elle gir (uygulamadaki ApiService.Security.APP_SECRET ile aynı)
+      - key: GEMINI_API_KEY
+        sync: false          # https://aistudio.google.com/apikey
+      - key: GROQ_API_KEY
+        sync: false          # https://console.groq.com/keys
+      # İsteğe bağlı (boş bırakırsan modeller otomatik seçilir):
+      # GEMINI_MODELS, GROQ_VISION_MODELS, GROQ_WHISPER_MODELS, GEMINI_MAX_OUTPUT
